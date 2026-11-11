@@ -2,6 +2,7 @@ import io
 import os
 import re
 import tempfile
+from collections.abc import Iterable
 from typing import cast
 import urllib.parse
 import weakref
@@ -13,6 +14,10 @@ import requests
 
 from .__version__ import __title__, __version__
 from .form import Form
+from .origin import (
+    _OriginRestrictedSession,
+    _parse_allowed_origins,
+)
 from .utils import LinkNotFoundError, is_disabled, is_multipart_file_upload
 
 
@@ -50,6 +55,21 @@ class Browser:
     :param raise_on_404: If True, raise :class:`LinkNotFoundError`
         when visiting a page triggers a 404 Not Found error.
     :param user_agent: Set the user agent header to this value.
+    :param allowed_origins: Restrict every request issued by this browser
+        (including each redirect hop) to the given iterable of allowed
+        origins. Entries are absolute ``http``/``https`` URLs or origins
+        (``scheme://host`` or ``scheme://host:port``); the scheme,
+        case-insensitive host and effective port are compared. Defaults to
+        ``None``, which leaves the restriction disabled (all origins are
+        allowed). An empty iterable enables the restriction with an empty
+        allow-set, so every request is rejected. Invalid entries raise
+        ``ValueError`` or ``TypeError`` before any network access. When the
+        restriction is enabled, requests to any other scheme (e.g.
+        ``file://``, ``ftp://``) or to a disallowed origin raise
+        :class:`~mechanicalsoup.OriginNotAllowedError` without sending a
+        single packet. The allow-set is per-browser: browsers sharing one
+        :class:`requests.Session` do not share their restrictions and the
+        session itself remains unrestricted when used directly.
 
     """
     def __init__(
@@ -59,9 +79,18 @@ class Browser:
         requests_adapters=None,
         raise_on_404=False,
         user_agent=None,
+        allowed_origins: "Iterable[str] | None" = None,
     ):
         self.raise_on_404 = raise_on_404
-        self.session = session or requests.Session()
+        # Validate the configuration before creating any session or touching
+        # the network, so an invalid value fails the constructor cleanly.
+        allowed = (_parse_allowed_origins(allowed_origins)
+                   if allowed_origins is not None else None)
+        prototype = session or requests.Session()
+        if allowed is None:
+            self.session = prototype
+        else:
+            self.session = _OriginRestrictedSession(prototype, allowed)
 
         self._finalize = weakref.finalize(self.session, self.close)
 
@@ -153,6 +182,38 @@ class Browser:
 
         # the requests module uses a case-insensitive dict for session headers
         self.session.headers['User-agent'] = user_agent
+
+    @property
+    def allowed_origins(self) -> "frozenset[str] | None":
+        """Frozenset of normalized origins this browser may contact.
+
+        ``None`` means origin restriction is disabled (the historical
+        default: any origin is reachable). Otherwise, requests to an origin
+        outside the set raise :class:`~mechanicalsoup.OriginNotAllowedError`
+        before any network I/O.
+        """
+        if isinstance(self.session, _OriginRestrictedSession):
+            return self.session.allowed_origins
+        return None
+
+    def add_allowed_origin(self, origin: str) -> None:
+        """Allow one additional origin at runtime.
+
+        :param origin: An absolute ``http``/``https`` URL or origin
+            (``scheme://host`` or ``scheme://host:port``). Invalid values
+            raise ``ValueError`` before any network access.
+
+        :raises RuntimeError: if origin restriction was not enabled when
+            constructing the browser (i.e. no ``allowed_origins`` argument
+            was passed).
+        """
+        if not isinstance(self.session, _OriginRestrictedSession):
+            raise RuntimeError(
+                "Origin restriction is disabled on this browser; pass an "
+                "allowed_origins argument to the Browser constructor to "
+                "enable it"
+            )
+        self.session.add_allowed_origin(origin)
 
     def request(self, *args, **kwargs) -> ResponseWithSoup:
         """Straightforward wrapper around `requests.Session.request
@@ -407,7 +468,11 @@ class Browser:
             self.session = None
 
     def __del__(self):
-        self._finalize()
+        # __init__ may have raised before _finalize was set (e.g. an invalid
+        # allowed_origins configuration); in that case there is nothing to do.
+        finalize = getattr(self, '_finalize', None)
+        if finalize is not None:
+            finalize()
 
     def __enter__(self):
         return self

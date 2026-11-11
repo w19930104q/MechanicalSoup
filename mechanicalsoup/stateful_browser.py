@@ -50,6 +50,11 @@ class StatefulBrowser(Browser):
     :param raise_on_404: If True, raise :class:`LinkNotFoundError`
         when visiting a page triggers a 404 Not Found error.
     :param user_agent: Set the user agent header to this value.
+    :param allowed_origins: Restrict every request issued by this browser
+        (including each redirect hop) to the given iterable of allowed
+        ``http``/``https`` origins. Defaults to ``None`` (restriction
+        disabled). See :class:`~mechanicalsoup.Browser` and
+        :class:`~mechanicalsoup.OriginNotAllowedError` for details.
 
     All arguments are forwarded to :func:`Browser`.
 

@@ -33,3 +33,6 @@ Exceptions
     :show-inheritance:
 .. autoexception:: InvalidFormMethod
     :show-inheritance:
+.. autoexception:: OriginNotAllowedError
+    :show-inheritance:
+    :members: url, origin

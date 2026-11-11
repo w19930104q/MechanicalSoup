@@ -195,6 +195,53 @@ To sum up, here is the complete example (`examples/expl_httpbin.py
 
 .. literalinclude:: ../examples/expl_httpbin.py
 
+Restricting which origins a browser may contact
+-----------------------------------------------
+
+When a browser follows untrusted links or redirects, a malicious page can
+try to make it send requests to arbitrary destinations (for example,
+internal services on ``localhost`` or a private network). MechanicalSoup
+can confine a browser to an explicit set of origins by passing
+``allowed_origins`` to its constructor::
+
+    browser = mechanicalsoup.StatefulBrowser(
+        allowed_origins=[
+            "https://example.com",          # scheme://host, default port
+            "https://api.example.com:8443",  # or with an explicit port
+        ]
+    )
+
+An origin is the scheme, host and port together; paths are irrelevant.
+Origins are compared on the scheme, the host (case-insensitive) and the
+effective port (so ``http://example.com`` and ``http://example.com:80``
+are the same origin). Only ``http`` and ``https`` are accepted, and
+invalid entries are rejected when the browser is constructed, before any
+network access. An empty list (``allowed_origins=[]``) enables the
+restriction with an empty allow-set, so every request is rejected.
+
+While the restriction is enabled, MechanicalSoup checks the target URL
+before the initial request **and before every redirect hop**. If the
+target is not allowed, no request is sent to it and
+:class:`~mechanicalsoup.OriginNotAllowedError` is raised; the exception
+exposes the offending URL through its ``url`` attribute and the
+normalized origin through ``origin``. A blocked request leaves the
+browser state (current page, URL and selected form) untouched, so the
+browser can keep working on an allowed page. Cookies set by an
+allowed redirect hop are kept; they are not rolled back.
+
+The allow-set belongs to the browser, not to its session: two browsers
+built on the same :class:`requests.Session` keep independent
+allow-sets, and using the shared session directly (``session.get(...)``)
+remains unrestricted. Adapters, cookies and other session settings are
+unaffected, and ``allow_redirects=False`` still returns the raw
+redirect response without following it.
+
+The restriction is disabled by default (no ``allowed_origins``
+argument), in which case the browser behaves exactly as before and any
+origin is reachable. The current allow-set can be read from the
+:attr:`~mechanicalsoup.Browser.allowed_origins` property and extended at
+runtime with :func:`~mechanicalsoup.Browser.add_allowed_origin`.
+
 .. _requests: http://docs.python-requests.org/en/master/
 .. _requests.Response: http://docs.python-requests.org/en/master/api/#requests.Response
 .. _bs4.BeautifulSoup: https://www.crummy.com/software/BeautifulSoup/bs4/doc/#beautifulsoup

@@ -16,6 +16,13 @@ Version 1.5 (in development)
 * ``StatefulBrowser.links`` now raises an explanatory ``AttributeError`` when
   no page is loaded, instead of failing inside BeautifulSoup.
 
+* Browsers now accept an optional ``allowed_origins`` argument that limits
+  which origins they may contact. When set, every request — including each
+  redirect hop — is checked against the browser's own allow-set before any
+  network I/O, and a disallowed target raises
+  :class:`~mechanicalsoup.OriginNotAllowedError` without sending a request.
+  The feature is disabled by default, so existing code is unaffected.
+
 Version 1.4
 ===========
 
