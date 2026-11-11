@@ -6,7 +6,12 @@ import warnings
 
 import bs4
 
-from .utils import LinkNotFoundError, is_multipart_file_upload
+from .utils import (
+    LinkNotFoundError,
+    is_disabled,
+    is_multipart_file_upload,
+    is_submit_control,
+)
 
 
 class InvalidFormMethod(LinkNotFoundError):
@@ -339,8 +344,9 @@ class Form:
         sent. Therefore, this does not need to be called if there is only
         one submit element in the form.
 
-        If the element is not found or if multiple elements match, raise a
-        :class:`LinkNotFoundError` exception.
+        If the element is not found, is disabled, or if multiple elements
+        match, raise a :class:`LinkNotFoundError` exception. When ``submit``
+        is ``None``, disabled submit elements are skipped.
 
         Example: ::
 
@@ -358,35 +364,43 @@ class Form:
         # Case-insensitive search for type=submit
         inps = [
             inp for inp in self.form.select('input[type="submit" i], button')
-            if (
-                not isinstance(inp_type := inp.get("type"), str)
-                or inp_type.lower() not in ('button', 'reset')
-            )
+            if is_submit_control(inp)
         ]
 
-        submit_chosen = None
+        if submit is None:
+            # Choose the first submit that is actually usable. A disabled
+            # submit cannot be activated, so it is skipped by default.
+            self._submit_chosen = next(
+                (inp for inp in inps if not is_disabled(inp)), None)
+            return self._submit_chosen
 
-        # If no submit specified, choose the first one
-        if submit is None and inps:
-            submit_chosen = inps[0]
+        if isinstance(submit, bs4.element.Tag):
+            matches = [inp for inp in inps if inp is submit]
+            if not matches:
+                # Preserve the historical behavior of accepting an
+                # equivalent Tag object (e.g. from another soup instance).
+                matches = [inp for inp in inps if inp == submit]
+        else:
+            matches = [
+                inp for inp in inps
+                if inp.has_attr('name') and inp['name'] == submit
+            ]
 
-        for inp in inps:
-            if (inp.has_attr('name') and inp['name'] == submit):
-                # Found the tag element by name
-                if submit_chosen is not None:
-                    raise LinkNotFoundError(
-                        f"Multiple submit elements match: {submit}"
-                    )
-                submit_chosen = inp
-            elif inp == submit:
-                # Found the exact input tag element
-                submit_chosen = inp
-                break
-
-        if submit_chosen is None and submit not in (None, False):
+        if len(matches) > 1:
+            raise LinkNotFoundError(
+                f"Multiple submit elements match: {submit}"
+            )
+        if not matches:
             raise LinkNotFoundError(
                 f"Specified submit element not found: {submit}"
             )
+
+        submit_chosen = matches[0]
+        if is_disabled(submit_chosen):
+            raise LinkNotFoundError(
+                f"Specified submit element is disabled: {submit}"
+            )
+
         self._submit_chosen = submit_chosen
 
         return self._submit_chosen

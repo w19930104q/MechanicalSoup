@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 import io
 import os
 import re
@@ -13,7 +14,220 @@ import requests
 
 from .__version__ import __title__, __version__
 from .form import Form
-from .utils import LinkNotFoundError, is_disabled, is_multipart_file_upload
+from .utils import (
+    LinkNotFoundError,
+    is_disabled,
+    is_submit_control,
+)
+
+
+_URLENCODED_ENCTYPE = "application/x-www-form-urlencoded"
+_MULTIPART_ENCTYPE = "multipart/form-data"
+_TEXT_PLAIN_ENCTYPE = "text/plain"
+
+
+class _MultipartFields(list):
+    """Ordered multipart fields that are truthy even when empty.
+
+    Requests only switches to multipart encoding when its ``files``
+    argument is truthy, but an empty form must still be sent with the
+    multipart enctype.
+    """
+
+    def __bool__(self):
+        return True
+
+
+def _normalize_newlines(value):
+    """Normalize line endings to CRLF, as required by form submission."""
+    if not isinstance(value, str):
+        return value
+    return (
+        value.replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .replace("\n", "\r\n")
+    )
+
+
+def _to_text(value):
+    """Convert a form value to text for text/plain serialization."""
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _basename(value):
+    """Return a file control's filename without touching the filesystem."""
+    if isinstance(value, io.IOBase):
+        value = getattr(value, "name", "")
+    if isinstance(value, os.PathLike):
+        value = os.fspath(value)
+    if isinstance(value, (str, bytes)):
+        return os.path.basename(os.fsdecode(value))
+    return ""
+
+
+def _to_pairs(value):
+    """Normalize a Requests data container into ordered (name, value) pairs."""
+    if value is None:
+        return []
+    if isinstance(value, Mapping):
+        return list(value.items())
+    return list(value)
+
+
+def _expand_pairs(pairs):
+    """Flatten list/tuple values into repeated fields, like Requests does."""
+    for name, value in pairs:
+        if (
+            isinstance(value, (list, tuple)) and
+            not isinstance(value, (str, bytes))
+        ):
+            for item in value:
+                yield name, item
+        else:
+            yield name, value
+
+
+def _form_entries(form, submit):
+    """Yield form controls in document order as (kind, name, value).
+
+    ``kind`` is either ``"field"`` or ``"file"``. Disabled controls are
+    omitted, and only the selected submit control contributes its value.
+    """
+    selector = ",".join(
+        f"{tag}[name]" for tag in ("input", "button", "textarea", "select")
+    )
+    for tag in form.select(selector):
+        name = tag.get("name")
+
+        if is_disabled(tag):
+            continue
+
+        if tag.name == "input":
+            tag_type = str(tag.get("type", "")).lower()
+            if tag_type == "submit":
+                # Skip submit controls that were not selected
+                if tag is not submit:
+                    continue
+                value = tag.get("value", "")
+            elif tag_type in ("button", "reset", "image"):
+                # These input types are never successful controls on their
+                # own. Only a selected submit control may contribute data.
+                continue
+            elif tag_type in ("radio", "checkbox"):
+                if "checked" not in tag.attrs:
+                    continue
+                value = tag.get("value", "on")
+            else:
+                # browsers use empty string for inputs with missing values
+                value = tag.get("value", "")
+
+            if tag_type == "file":
+                yield "file", name, value
+            else:
+                yield "field", name, value
+
+        elif tag.name == "button":
+            # Buttons are only included if they are the selected submit
+            if tag is not submit or not is_submit_control(tag):
+                continue
+            yield "field", name, tag.get("value", "")
+
+        elif tag.name == "textarea":
+            yield "field", name, tag.text
+
+        elif tag.name == "select":
+            for value in _selected_values(tag):
+                yield "field", name, value
+
+
+def _selected_values(select):
+    """Return the values a select control submits, in selection order."""
+    options = []
+    for option in select.select("option"):
+        if is_disabled(option):
+            continue
+        if any(optgroup.has_attr("disabled")
+               for optgroup in option.find_parents("optgroup")):
+            continue
+        options.append(option)
+
+    selected = [
+        option.get("value", option.text) for option in options
+        if "selected" in option.attrs
+    ]
+
+    if "multiple" in select.attrs:
+        return selected
+    if selected:
+        # A standard select element only allows one option to be selected,
+        # but browsers pick the last one if somehow multiple are marked.
+        return [selected[-1]]
+    if options:
+        # Selects the first option if none are selected
+        return [options[0].get("value", options[0].text)]
+    return []
+
+
+def _submitter_attr(form, submit, attribute, form_attribute):
+    """Return a submit control's attribute, falling back to the form's."""
+    if (
+        isinstance(submit, bs4.element.Tag) and
+        is_submit_control(submit) and
+        submit.has_attr(attribute)
+    ):
+        return submit.get(attribute)
+    return form.get(form_attribute)
+
+
+def _effective_method(form, submit):
+    """Return the HTTP method, honoring the selected submit's override."""
+    method = _submitter_attr(form, submit, "formmethod", "method")
+    if method is None:
+        return "get"
+    method = str(method).strip()
+    # Per the HTML specification, an empty or missing formmethod means GET.
+    return method or "get"
+
+
+def _effective_enctype(form, submit):
+    """Return the form encoding, honoring the selected submit's override."""
+    enctype = _submitter_attr(form, submit, "formenctype", "enctype")
+    if enctype is None:
+        return _URLENCODED_ENCTYPE
+    enctype = str(enctype).strip().lower()
+    if enctype in (
+        _URLENCODED_ENCTYPE, _MULTIPART_ENCTYPE, _TEXT_PLAIN_ENCTYPE
+    ):
+        return enctype
+    # Invalid enctypes fall back to the default form encoding.
+    return _URLENCODED_ENCTYPE
+
+
+def _effective_action(form, submit):
+    """Return the form action, honoring the selected submit's override."""
+    return _submitter_attr(form, submit, "formaction", "action")
+
+
+def _multipart_file_value(value):
+    """Return a multipart (filename, content) pair for a file control.
+
+    Only file objects explicitly opened by the caller are uploaded. A
+    string (e.g. a malicious default value supplied by a server) is never
+    opened; it only contributes its basename as the filename.
+    """
+    filename = _basename(value)
+    if isinstance(value, io.IOBase):
+        return filename, value
+    return filename, b""
+
+
+def _file_field_value(value):
+    """Return the value a file control contributes without multipart."""
+    return _basename(value)
 
 
 class ResponseWithSoup(requests.Response):
@@ -217,130 +431,110 @@ class Browser:
     @classmethod
     def get_request_kwargs(cls, form, url=None, submit=None, **kwargs):
         """Extract input data from the form."""
-        method = str(form.get("method", "get"))
-        action = form.get("action")
+        if (
+            isinstance(submit, bs4.element.Tag) and
+            is_submit_control(submit) and
+            is_disabled(submit)
+        ):
+            raise LinkNotFoundError(
+                "The selected submit element is disabled and cannot be used "
+                "to submit the form."
+            )
 
-        # If the form has a submit button, use its form action
-        # https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/button#formaction.
-        if isinstance(submit, bs4.element.Tag) and (submit.name == "button"):
-            action = submit.get("formaction", action)
+        method = _effective_method(form, submit)
+        action = _effective_action(form, submit)
 
-        url = urllib.parse.urljoin(url, action)
-        if url is None:  # This happens when both `action` and `url` are None.
+        # An empty action (from the form or the selected submit) refers to
+        # the current page. If there is no current page either, there is no
+        # URL to submit to.
+        if action is None:
+            action = url
+        target = urllib.parse.urljoin(url, action)
+        if not target:
             raise ValueError('no URL to submit to')
 
-        # read https://www.w3.org/TR/html52/sec-forms.html
-        if method.lower() == "get":
-            data = kwargs.pop("params", dict())
+        is_get = method.lower() == "get"
+        if is_get:
+            params = _to_pairs(kwargs.pop("params", None))
+            caller_files = kwargs.pop("files", None)
         else:
-            data = kwargs.pop("data", dict())
-        files = kwargs.pop("files", dict())
+            enctype = _effective_enctype(form, submit)
+            data = _to_pairs(kwargs.pop("data", None))
+            caller_files = kwargs.pop("files", None)
 
-        # Use a list of 2-tuples to better reflect the behavior of browser QSL.
-        # Requests also retains order when encoding form data in 2-tuple lists.
-        data = [(k, v) for k, v in data.items()]
+        entries = _form_entries(form, submit)
 
-        multipart = form.get("enctype", "") == "multipart/form-data"
+        if is_get:
+            # File controls only contribute their filename in a GET request,
+            # even if the form uses a multipart enctype.
+            for kind, name, value in entries:
+                if kind == "file":
+                    value = _file_field_value(value)
+                params.append((name, value))
+            return cls._get_request_kwargs(
+                method, target,
+                params=params,
+                files=caller_files if caller_files is not None else {},
+                **kwargs,
+            )
 
-        # Process form tags in the order that they appear on the page,
-        # skipping those tags that do not have a name-attribute.
-        selector = ",".join(f"{tag}[name]" for tag in
-                            ("input", "button", "textarea", "select"))
-        submit_added = False
-        for tag in form.select(selector):
-            name = tag.get("name")  # name-attribute of tag
+        if enctype == _TEXT_PLAIN_ENCTYPE:
+            fields = list(_expand_pairs(data))
+            for kind, name, value in entries:
+                if kind == "file":
+                    value = _file_field_value(value)
+                fields.append((name, value))
+            body = "".join(
+                f"{_to_text(name)}="
+                f"{_normalize_newlines(_to_text(value))}\r\n"
+                for name, value in fields
+            ).encode("utf-8")
+            headers = dict(kwargs.get("headers") or {})
+            for header in list(headers):
+                if header.lower() == "content-type":
+                    del headers[header]
+            headers["Content-Type"] = _TEXT_PLAIN_ENCTYPE
+            kwargs["headers"] = headers
+            return cls._get_request_kwargs(
+                method, target,
+                data=body,
+                files={},
+                **kwargs,
+            )
 
-            # Skip disabled elements, since they should not be submitted.
-            # A control is also disabled when it descends from a disabled
-            # <fieldset> (outside that fieldset's first <legend>).
-            if is_disabled(tag):
-                continue
-
-            if tag.name == "input":
-                tag_type = tag.get("type", "").lower()
-                if tag_type == "submit":
-                    # Skip submit-type inputs that were not selected
-                    if submit_added or (tag != submit):
-                        continue
-                    # Avoid duplicate submits
-                    submit_added = True
-
-                if tag_type in ("radio", "checkbox"):
-                    if "checked" not in tag.attrs:
-                        continue
-                    value = tag.get("value", "on")
+        if enctype == _MULTIPART_ENCTYPE:
+            # Build one ordered list of parts so that normal and file fields
+            # with the same name (including interleaved ones) are preserved
+            # in control order. Requests encodes list entries in order.
+            fields = _MultipartFields()
+            for name, value in _expand_pairs(data):
+                fields.append((name, (None, value)))
+            if caller_files is not None:
+                fields.extend(_to_pairs(caller_files))
+            for kind, name, value in entries:
+                if kind == "file":
+                    fields.append((name, _multipart_file_value(value)))
                 else:
-                    # browsers use empty string for inputs with missing values
-                    value = tag.get("value", "")
+                    fields.append(
+                        (name, (None, _normalize_newlines(value)))
+                    )
+            return cls._get_request_kwargs(
+                method, target,
+                files=fields,
+                **kwargs,
+            )
 
-                # If the enctype is not multipart, the filename is put in
-                # the form as a text input and the file is not sent.
-                if is_multipart_file_upload(form, tag):
-                    if isinstance(value, io.IOBase):
-                        content = value
-                        filename = os.path.basename(getattr(value, "name", ""))
-                    else:
-                        content = ""
-                        filename = os.path.basename(value)
-                    # If content is the empty string, we still pass it
-                    # for consistency with browsers (see
-                    # https://github.com/MechanicalSoup/MechanicalSoup/issues/250).
-                    files[name] = (filename, content)
-                else:
-                    if isinstance(value, io.IOBase):
-                        value = os.path.basename(getattr(value, "name", ""))
-                    data.append((name, value))
-
-            elif tag.name == "button":
-                # Buttons are only included if they are the selected submit
-                if submit_added or (tag != submit):
-                    continue
-                submit_added = True
-                data.append((name, tag.get("value", "")))
-
-            elif tag.name == "textarea":
-                data.append((name, tag.text))
-
-            elif tag.name == "select":
-                # If the value attribute is not specified, the content will
-                # be passed as a value instead.
-                options = tag.select("option")
-                selected_values = [i.get("value", i.text) for i in options
-                                   if "selected" in i.attrs]
-                if "multiple" in tag.attrs:
-                    for value in selected_values:
-                        data.append((name, value))
-                elif selected_values:
-                    # A standard select element only allows one option to be
-                    # selected, but browsers pick last if somehow multiple.
-                    data.append((name, selected_values[-1]))
-                elif options:
-                    # Selects the first option if none are selected
-                    first_value = options[0].get("value", options[0].text)
-                    data.append((name, first_value))
-
-        if method.lower() == "get":
-            kwargs["params"] = data
-        else:
-            kwargs["data"] = data
-
-        # The following part of the function is here to respect the
-        # enctype specified by the form, i.e. force sending multipart
-        # content. Since Requests doesn't have yet a feature to choose
-        # enctype, we have to use tricks to make it behave as we want
-        # This code will be updated if Requests implements it.
-        if multipart and not files:
-            # Requests will switch to "multipart/form-data" only if
-            # files pass the `if files:` test, so in this case we use
-            # a modified dict that passes the if test even if empty.
-            class DictThatReturnsTrue(dict):
-                def __bool__(self):
-                    return True
-                __nonzero__ = __bool__
-
-            files = DictThatReturnsTrue()
-
-        return cls._get_request_kwargs(method, url, files=files, **kwargs)
+        # application/x-www-form-urlencoded
+        for kind, name, value in entries:
+            if kind == "file":
+                value = _file_field_value(value)
+            data.append((name, value))
+        return cls._get_request_kwargs(
+            method, target,
+            data=data,
+            files=caller_files if caller_files is not None else {},
+            **kwargs,
+        )
 
     def _request(
         self,

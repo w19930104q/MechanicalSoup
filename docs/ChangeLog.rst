@@ -5,6 +5,15 @@ Release Notes
 Version 1.5 (in development)
 ============================
 
+* The ``formaction``, ``formmethod`` and ``formenctype`` attributes of the
+  selected submit button or submit-type input now override the corresponding
+  form attributes. Missing attributes fall back to the form, and an empty
+  action submits to the current page. Form submission now supports the
+  ``text/plain`` enctype, sends only the filename for file fields outside
+  multipart uploads, and preserves the document order of same-named normal
+  and file fields. Disabled submit controls are skipped unless explicitly
+  selected, in which case an error is raised.
+
 * When the ``Content-Type`` header is missing, HTML is now detected from the
   first bytes of the response instead of decoding the whole body, which is
   much faster for large binary responses. Uppercase markup such as ``<HTML>``

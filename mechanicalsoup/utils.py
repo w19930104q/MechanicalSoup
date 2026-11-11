@@ -16,10 +16,30 @@ class LinkNotFoundError(Exception):
     pass
 
 
+def is_file_input(tag):
+    """Return whether ``tag`` is an ``<input type="file">`` control."""
+    return tag.name == "input" and str(tag.get("type", "")).lower() == "file"
+
+
+def is_submit_control(tag):
+    """Return whether ``tag`` is a button/input that can submit a form.
+
+    Both ``<input type="submit">`` and ``<button>`` (other than explicit
+    ``type="button"`` or ``type="reset"`` buttons) are submit controls.
+    """
+    if tag.name == "input":
+        return str(tag.get("type", "")).lower() == "submit"
+    if tag.name == "button":
+        button_type = tag.get("type")
+        return (not isinstance(button_type, str) or
+                button_type.lower() not in ("button", "reset"))
+    return False
+
+
 def is_multipart_file_upload(form, tag):
     return (
         form.get("enctype", "") == "multipart/form-data" and
-        tag.get("type", "").lower() == "file"
+        is_file_input(tag)
     )
 
 
